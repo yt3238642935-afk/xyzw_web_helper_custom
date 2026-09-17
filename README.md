@@ -14,6 +14,15 @@
 
 基于Vue 3 + Vite的现代化XYZW游戏辅助工具，支持Token管理、WebSocket通信、游戏自动化等功能。
 
+## 二次开发说明
+
+本项目基于 w1249178256/xyzw_web_helper 进行二次开发。
+
+原项目：
+https://github.com/w1249178256/xyzw_web_helper
+
+本项目继续遵循原项目的 CC BY-NC-SA 4.0 License。
+
 </div>
 
 ---
@@ -666,36 +675,5 @@ git push origin feature/new-feature
   - [x] 支持Token自动刷新功能
   - [x] 响应式状态管理优化
   - [x] DOM变化监听和事件驱动更新
-
-## 📄 许可证
-
-本项目基于 [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](LICENSE) 许可证。
-
-**⚠️ 重要声明：**
-- ✅ **允许**：个人学习、研究、修改和分享
-- ❌ **禁止**：商业用途、销售、商业化运营
-- 📝 **要求**：署名、相同许可证分享、标注修改
-
-详细许可条款请查看 [LICENSE](LICENSE) 文件。
-
----
-
-## 📞 联系方式
-
-- **项目主页**：[GitHub Repository](https://github.com/w1249178256/xyzw_web_helper)
-- **问题反馈**：[GitHub Issues](https://github.com/w1249178256/xyzw_web_helper/issues)
-- **联系邮箱**：[发邮件给我](mailto:stevefeng59@gmail.com)
-- **TG群组**：[欢迎加入](https://t.me/+SEDhXWN_OpNiMGI1)
-
----
-
-## 👏 赞赏
-<img src="https://github.com/w1249178256/xyzw_web_helper/blob/main/public/IMG_8007.JPG" width="200" height="200">
-
-<div align="center">
-
-**⭐ 如果这个项目对你有帮助，请给它一个星标！**
-
-Made with ❤️ by FF Team
 
 </div>
