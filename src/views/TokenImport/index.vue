@@ -149,16 +149,14 @@
               添加Token
             </n-button>
 
-            <n-dropdown :options="bulkOptions" @select="handleBulkAction">
-              <n-button>
-                <template #icon>
-                  <n-icon>
-                    <Menu />
-                  </n-icon>
-                </template>
-                批量操作
-              </n-button>
-            </n-dropdown>
+            <n-button @click="openBulkOperationModal">
+              <template #icon>
+                <n-icon>
+                  <Menu />
+                </n-icon>
+              </template>
+              批量操作
+            </n-button>
           </div>
         </div>
 
@@ -566,6 +564,96 @@
       </a-empty>
     </div>
 
+    <!-- 选择账号后的批量操作模态框 -->
+    <n-modal
+      v-model:show="showBulkOperationModal"
+      preset="card"
+      title="批量操作"
+      style="width: min(600px, 92vw)"
+    >
+      <n-space vertical :size="16">
+        <div
+          style="
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+          "
+        >
+          <n-checkbox
+            :checked="isBulkAllSelected"
+            :indeterminate="isBulkIndeterminate"
+            @update:checked="toggleBulkSelectAll"
+          >
+            全选
+          </n-checkbox>
+          <span style="color: var(--text-color-3); font-size: 13px">
+            已选 {{ bulkSelectedTokenIds.length }} /
+            {{ tokenStore.gameTokens.length }} 个账号
+          </span>
+        </div>
+
+        <div
+          style="
+            max-height: 360px;
+            overflow-y: auto;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 10px 12px;
+          "
+        >
+          <n-checkbox-group v-model:value="bulkSelectedTokenIds">
+            <n-space vertical :size="6">
+              <n-checkbox
+                v-for="token in sortedTokens"
+                :key="token.id"
+                :value="token.id"
+              >
+                <span>{{ token.name }}</span>
+                <n-tag
+                  v-if="token.server"
+                  size="small"
+                  style="margin-left: 8px"
+                >
+                  {{ token.server }}
+                </n-tag>
+              </n-checkbox>
+            </n-space>
+          </n-checkbox-group>
+        </div>
+
+        <n-select
+          v-model:value="selectedBulkAction"
+          :options="bulkOptions"
+          placeholder="请选择要对已选账号执行的操作"
+          clearable
+        />
+
+        <n-alert type="info" :show-icon="false">
+          只有勾选的账号会执行上述批量操作；未勾选账号不会被修改、断开或删除。
+        </n-alert>
+      </n-space>
+
+      <template #footer>
+        <div
+          style="
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+          "
+        >
+          <n-button @click="importTokenFile">导入Token文件</n-button>
+          <n-space>
+            <n-button @click="showBulkOperationModal = false">取消</n-button>
+            <n-button type="primary" @click="executeSelectedBulkAction">
+              执行所选操作
+            </n-button>
+          </n-space>
+        </div>
+      </template>
+    </n-modal>
+
     <!-- 编辑Token模态框 -->
     <n-modal
       v-model:show="showEditModal"
@@ -643,7 +731,7 @@ import {
   GameController,
 } from "@vicons/ionicons5";
 import { NIcon, NAlert, useDialog, useMessage } from "naive-ui";
-import { h, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, h, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { transformToken, scheduleAuthUserRequest } from "@/utils/token";
 import { $emit } from "@/stores/events/index.ts";
@@ -681,6 +769,22 @@ const editingToken = ref(null);
 const importMethod = ref("manual");
 const refreshingTokens = ref(new Set());
 const connectingTokens = ref(new Set());
+
+// 批量操作：账号选择与操作选择
+const showBulkOperationModal = ref(false);
+const bulkSelectedTokenIds = ref([]);
+const selectedBulkAction = ref(null);
+
+const isBulkAllSelected = computed(() => {
+  const total = tokenStore.gameTokens.length;
+  return total > 0 && bulkSelectedTokenIds.value.length === total;
+});
+
+const isBulkIndeterminate = computed(() => {
+  const selected = bulkSelectedTokenIds.value.length;
+  const total = tokenStore.gameTokens.length;
+  return selected > 0 && selected < total;
+});
 // 从localStorage读取上次的视图模式，默认为列表视图
 const viewMode = ref(localStorage.getItem("tokenViewMode") || "list");
 const dragIndex = ref(null);
@@ -821,13 +925,12 @@ const editRules = {
 };
 
 const bulkOptions = [
-  { label: "刷新所有Token", key: "refreshAll" },
-  { label: "更新token信息", key: "updateInfo" },
-  { label: "导出所有Token", key: "export" },
-  { label: "导入Token文件", key: "import" },
-  { label: "清理过期Token", key: "clean" },
-  { label: "断开所有连接", key: "disconnect" },
-  { label: "清除所有Token", key: "clear" },
+  { label: "刷新所选Token", value: "refreshAll" },
+  { label: "更新所选Token信息", value: "updateInfo" },
+  { label: "导出所选Token", value: "export" },
+  { label: "清理所选过期Token", value: "clean" },
+  { label: "断开所选连接", value: "disconnect" },
+  { label: "删除所选Token", value: "clear" },
 ];
 
 /**
@@ -1242,32 +1345,33 @@ const deleteToken = (token) => {
   });
 };
 
-// 批量刷新所有URLToken
-const refreshAllTokens = async () => {
-  if (!tokenStore.gameTokens.length) {
+// 批量刷新所选、且支持自动刷新的 Token
+const refreshAllTokens = async (targetTokens = tokenStore.gameTokens) => {
+  const sourceTokens = [...targetTokens];
+
+  if (!sourceTokens.length) {
     message.warning("没有可刷新的Token");
     return;
   }
 
-  const tokensToRefresh = tokenStore.gameTokens.filter(
+  const tokensToRefresh = sourceTokens.filter(
     (token) =>
       token.importMethod === "url" ||
       token.importMethod === "wxQrcode" ||
       token.importMethod === "bin",
   );
-  const manualTokens = tokenStore.gameTokens.filter(
+  const manualTokens = sourceTokens.filter(
     (token) => token.importMethod === "manual",
   );
 
   if (tokensToRefresh.length === 0) {
-    message.warning("没有支持自动刷新的Token");
+    message.warning("所选账号中没有支持自动刷新的Token");
     return;
   }
 
-  // 显示确认对话框
   dialog.warning({
-    title: "批量刷新Token",
-    content: "确定要刷新所有支持自动刷新的Token吗?",
+    title: "批量刷新所选Token",
+    content: `确定要刷新所选账号中 ${tokensToRefresh.length} 个支持自动刷新的Token吗？`,
     positiveText: "开始刷新",
     negativeText: "取消",
     onPositiveClick: async () => {
@@ -1275,7 +1379,6 @@ const refreshAllTokens = async () => {
         let successCount = 0;
         let failCount = 0;
 
-        // 显示进度提示
         const loadingMessage = message.loading(
           `正在批量刷新Token (0/${tokensToRefresh.length})`,
           {
@@ -1287,10 +1390,7 @@ const refreshAllTokens = async () => {
           const token = tokensToRefresh[i];
 
           try {
-            // 更新进度显示
             loadingMessage.content = `正在刷新Token (${i + 1}/${tokensToRefresh.length}): ${token.name}`;
-
-            // 调用单个刷新函数（限流器会自动处理等待）
             await refreshToken(token);
             successCount++;
           } catch (error) {
@@ -1299,13 +1399,9 @@ const refreshAllTokens = async () => {
           }
         }
 
-        // 关闭进度提示
         loadingMessage.destroy();
-
-        // 关闭限流等待提示
         rateLimitWaiting.value = false;
 
-        // 显示结果
         if (failCount === 0) {
           message.success(`批量刷新完成！成功刷新 ${successCount} 个Token`);
         } else {
@@ -1314,9 +1410,10 @@ const refreshAllTokens = async () => {
           );
         }
 
-        // 如果有手动导入的Token，提示用户
         if (manualTokens.length > 0) {
-          message.info(`${manualTokens.length} 个手动导入的Token需要手动刷新`);
+          message.info(
+            `所选账号中有 ${manualTokens.length} 个手动导入的Token需要手动刷新`,
+          );
         }
       } catch (error) {
         message.error("批量刷新过程中发生错误: " + error.message);
@@ -1325,45 +1422,86 @@ const refreshAllTokens = async () => {
   });
 };
 
-const handleBulkAction = (key) => {
-  switch (key) {
+const openBulkOperationModal = () => {
+  // 默认不选，避免误执行删除/断开等操作。
+  bulkSelectedTokenIds.value = [];
+  selectedBulkAction.value = null;
+  showBulkOperationModal.value = true;
+};
+
+const toggleBulkSelectAll = (checked) => {
+  bulkSelectedTokenIds.value = checked
+    ? sortedTokens.value.map((token) => token.id)
+    : [];
+};
+
+const getSelectedBulkTokens = () => {
+  const selectedIds = new Set(bulkSelectedTokenIds.value);
+  return tokenStore.gameTokens.filter((token) => selectedIds.has(token.id));
+};
+
+const executeSelectedBulkAction = async () => {
+  if (!selectedBulkAction.value) {
+    message.warning("请先选择批量操作");
+    return;
+  }
+
+  const targetTokens = getSelectedBulkTokens();
+  if (targetTokens.length === 0) {
+    message.warning("请至少选择一个账号");
+    return;
+  }
+
+  // 使用快照，关闭弹窗后也不会影响本次操作对象。
+  const selectedTokensSnapshot = [...targetTokens];
+  const action = selectedBulkAction.value;
+  showBulkOperationModal.value = false;
+
+  switch (action) {
     case "refreshAll":
-      refreshAllTokens();
+      await refreshAllTokens(selectedTokensSnapshot);
       break;
     case "updateInfo":
-      updateAllTokenInfo();
+      await updateAllTokenInfo(selectedTokensSnapshot);
       break;
     case "export":
-      exportTokens();
-      break;
-    case "import":
-      importTokenFile();
+      exportTokens(selectedTokensSnapshot);
       break;
     case "clean":
-      cleanExpiredTokens();
+      await cleanExpiredTokens(selectedTokensSnapshot);
       break;
     case "disconnect":
-      disconnectAll();
+      disconnectAll(selectedTokensSnapshot);
       break;
     case "clear":
-      clearAllTokens();
+      clearAllTokens(selectedTokensSnapshot);
       break;
   }
 };
 
-const exportTokens = () => {
+const exportTokens = (targetTokens = tokenStore.gameTokens) => {
   try {
+    const selectedIds = new Set(targetTokens.map((token) => token.id));
     const data = tokenStore.exportTokens();
+
+    // 保留 store 原有导出结构，仅筛选 tokens 字段。
+    data.tokens = (data.tokens || []).filter((token) =>
+      selectedIds.has(token.id),
+    );
+
     const dataStr = JSON.stringify(data, null, 2);
     const dataBlob = new Blob([dataStr], { type: "application/json" });
 
     const link = document.createElement("a");
-    link.href = URL.createObjectURL(dataBlob);
-    link.download = `tokens_backup_${new Date().toISOString().split("T")[0]}.json`;
+    const objectUrl = URL.createObjectURL(dataBlob);
+    link.href = objectUrl;
+    link.download = `tokens_selected_${new Date().toISOString().split("T")[0]}.json`;
     link.click();
+    URL.revokeObjectURL(objectUrl);
 
-    message.success("Token数据已导出");
+    message.success(`已导出 ${data.tokens.length} 个所选Token`);
   } catch (error) {
+    console.error("导出Token失败:", error);
     message.error("导出失败");
   }
 };
@@ -1395,51 +1533,99 @@ const importTokenFile = () => {
   input.click();
 };
 
-const cleanExpiredTokens = async () => {
-  const count = await tokenStore.cleanExpiredTokens();
-  message.success(`已清理 ${count} 个过期Token`);
+const cleanExpiredTokens = async (targetTokens = tokenStore.gameTokens) => {
+  const sourceTokens = [...targetTokens];
+  if (sourceTokens.length === 0) {
+    message.warning("没有选择可清理的Token");
+    return;
+  }
+
+  const now = new Date();
+  const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+  // 与 tokenStore.cleanExpiredTokens() 保持同一过期规则，
+  // 但只检查本次明确勾选的账号。
+  const tokensToRemove = sourceTokens.filter((token) => {
+    if (
+      token.importMethod === "url" ||
+      token.importMethod === "bin" ||
+      token.importMethod === "wxQrcode" ||
+      token.upgradedToPermanent
+    ) {
+      return false;
+    }
+
+    const lastUsed = new Date(token.lastUsed || token.createdAt);
+    return lastUsed <= oneDayAgo;
+  });
+
+  for (const token of tokensToRemove) {
+    await tokenStore.removeToken(token.id);
+  }
+
+  message.success(
+    `已从 ${sourceTokens.length} 个所选账号中清理 ${tokensToRemove.length} 个过期Token`,
+  );
 };
 
-const disconnectAll = () => {
-  tokenStore.gameTokens.forEach((token) => {
+const disconnectAll = (targetTokens = tokenStore.gameTokens) => {
+  const sourceTokens = [...targetTokens];
+  sourceTokens.forEach((token) => {
     tokenStore.closeWebSocketConnection(token.id);
   });
-  message.success("所有连接已断开");
+  message.success(`已断开 ${sourceTokens.length} 个所选账号的连接`);
 };
 
-const clearAllTokens = () => {
+const clearAllTokens = (targetTokens = tokenStore.gameTokens) => {
+  const sourceTokens = [...targetTokens];
+
+  if (sourceTokens.length === 0) {
+    message.warning("没有选择要删除的Token");
+    return;
+  }
+
   dialog.error({
-    title: "清除所有Token",
-    content: "确定要清除所有Token吗？此操作无法恢复！",
-    positiveText: "确定清除",
+    title: "删除所选Token",
+    content: `确定要删除选中的 ${sourceTokens.length} 个Token吗？未选中的Token不会受到影响。此操作无法恢复！`,
+    positiveText: "确定删除",
     negativeText: "取消",
     onPositiveClick: async () => {
-      await tokenStore.clearAllTokens();
-      message.success("所有Token已清除");
+      for (const token of sourceTokens) {
+        await tokenStore.removeToken(token.id);
+      }
+
+      // 删除后同步清理批量选择状态。
+      const removedIds = new Set(sourceTokens.map((token) => token.id));
+      bulkSelectedTokenIds.value = bulkSelectedTokenIds.value.filter(
+        (id) => !removedIds.has(id),
+      );
+
+      message.success(`已删除 ${sourceTokens.length} 个所选Token`);
     },
   });
 };
 
-// 一键连接更新所有token信息
-const updateAllTokenInfo = async () => {
-  if (tokenStore.gameTokens.length === 0) {
+// 一键连接更新所选 token 信息
+const updateAllTokenInfo = async (targetTokens = tokenStore.gameTokens) => {
+  const tokensToUpdate = [...targetTokens];
+
+  if (tokensToUpdate.length === 0) {
     message.warning("没有可更新的Token");
     return;
   }
 
   dialog.warning({
-    title: "更新所有Token信息",
+    title: "更新所选Token信息",
     content:
-      "此操作将逐个连接所有Token，获取最新的角色名称和服务器信息，完成后自动断开连接。\n\n预计耗时：约3-5秒/个Token",
+      `此操作将逐个连接选中的 ${tokensToUpdate.length} 个Token，获取最新的角色名称和服务器信息，完成后自动断开连接。\n\n预计耗时：约3-5秒/个Token`,
     positiveText: "开始更新",
     negativeText: "取消",
     onPositiveClick: async () => {
       try {
         let successCount = 0;
         let failCount = 0;
-        const totalTokens = tokenStore.gameTokens.length;
+        const totalTokens = tokensToUpdate.length;
 
-        // 显示进度提示
         const loadingMessage = message.loading(
           `正在更新Token信息 (0/${totalTokens})`,
           {
@@ -1447,21 +1633,17 @@ const updateAllTokenInfo = async () => {
           },
         );
 
-        // 顺序处理每个token
-        for (let i = 0; i < tokenStore.gameTokens.length; i++) {
-          const token = tokenStore.gameTokens[i];
+        for (let i = 0; i < tokensToUpdate.length; i++) {
+          const token = tokensToUpdate[i];
 
-          // 更新进度显示
           loadingMessage.content = `正在更新Token信息 (${i + 1}/${totalTokens}): ${token.name}`;
 
           try {
-            // 连接token获取角色信息
             await tokenStore.selectToken(token.id);
 
-            // 等待1秒确保角色信息已获取（可根据实际情况调整）
+            // 等待角色信息返回，保持原逻辑不变。
             await new Promise((resolve) => setTimeout(resolve, 1000));
 
-            // 断开连接
             tokenStore.closeWebSocketConnection(token.id);
 
             successCount++;
@@ -1472,19 +1654,16 @@ const updateAllTokenInfo = async () => {
             message.error(`Token "${token.name}" 信息更新失败`);
           }
 
-          // 添加短暂延迟，避免服务器压力过大
-          if (i < tokenStore.gameTokens.length - 1) {
+          if (i < tokensToUpdate.length - 1) {
             await new Promise((resolve) => setTimeout(resolve, 500));
           }
         }
 
-        // 关闭进度提示
         loadingMessage.destroy();
 
-        // 显示结果
         if (failCount === 0) {
           message.success(
-            `所有Token信息更新完成！成功更新 ${successCount} 个Token`,
+            `所选Token信息更新完成！成功更新 ${successCount} 个Token`,
           );
         } else {
           message.warning(
