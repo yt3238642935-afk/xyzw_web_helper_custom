@@ -4434,7 +4434,7 @@ const verifyTaskDependencies = async (task) => {
 
   // Verify task functions exist
   for (const taskName of task.selectedTasks) {
-    const taskFunction = eval(taskName);
+    const taskFunction = resolveScheduledTaskFunction(taskName);
     if (typeof taskFunction !== "function") {
       addLog({
         time: new Date().toLocaleTimeString(),
@@ -4469,6 +4469,52 @@ const verifyTaskDependencies = async (task) => {
     type: "success",
   });
   return true;
+};
+
+
+// 定时任务函数白名单
+// 用显式映射替代 eval，避免任意代码执行风险和构建警告
+const resolveScheduledTaskFunction = (taskName) => {
+  const taskFunctions = {
+    startBatch,
+    claimHangUpRewards,
+    batchAddHangUpTime,
+    resetBottles,
+    batchlingguanzi,
+    climbTower,
+    climbWeirdTower,
+    batchStudy,
+    batchSmartSendCar,
+    batchClaimCars,
+    batchOpenBox,
+    batchOpenBoxByPoints,
+    batchClaimBoxPointReward,
+    batchFish,
+    batchRecruit,
+    batchbaoku13,
+    batchbaoku45,
+    batchmengjing,
+    batchclubsign,
+    batcharenafight,
+    batchTopUpFish,
+    batchTopUpArena,
+    batchClaimFreeEnergy,
+    skinChallenge,
+    legion_storebuygoods,
+    store_purchase,
+    collection_claimfreereward,
+    batchLegacyClaim,
+    batchLegacyGiftSendEnhanced,
+    batchUseItems,
+    batchMergeItems,
+    batchClaimPeachTasks,
+    batchGenieSweep,
+    batchBuyDreamItems,
+  };
+
+  return Object.prototype.hasOwnProperty.call(taskFunctions, taskName)
+    ? taskFunctions[taskName]
+    : undefined;
 };
 
 // Execute a scheduled task with dependency verification
@@ -4600,7 +4646,7 @@ const executeScheduledTask = async (task) => {
       });
 
       // Call the task function dynamically
-      const taskFunction = eval(taskName);
+      const taskFunction = resolveScheduledTaskFunction(taskName);
       if (typeof taskFunction === "function") {
         // For batch operations, pass isScheduledTask = true
         // 具体的batch任务函数内部会使用ensureConnection管理并行连接
