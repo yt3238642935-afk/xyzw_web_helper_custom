@@ -344,6 +344,13 @@ const STATUS = Object.freeze({
 const message = useMessage();
 const tokenStore = useTokenStore();
 
+// 外部任务调度接入
+// 日常任务抢占主线时使用，不替代 stopOne()
+import { useAutomationScheduler } from "@/stores/automationScheduler";
+
+const automationScheduler = useAutomationScheduler();
+
+
 const selectedTokenIds = ref([]);
 const selectedGroupIds = ref([]);
 const campaignTokenIds = ref([]);
@@ -1477,6 +1484,39 @@ function manualContinue(tokenId) {
   enqueue(tokenId, { front: true });
   addLog(tokenId, state.tokenName, "已手动解除停止状态并重新排队", "info");
 }
+
+
+
+// 外部任务暂停入口
+// TODO:
+// 后续可进一步接入 runningStates 快照。
+// 当前只提供安全调度入口，避免破坏已有状态机。
+async function pauseForScheduledTask() {
+
+  automationScheduler.markMainlinePaused();
+
+  addLog(
+    "system",
+    "system",
+    "主线推图已进入外部任务暂停阶段",
+    "warning"
+  );
+}
+
+
+// 外部任务恢复入口
+async function resumeFromScheduledTask() {
+
+  automationScheduler.restoreFinished();
+
+  addLog(
+    "system",
+    "system",
+    "主线推图恢复调度",
+    "info"
+  );
+}
+
 
 function stopOne(tokenId, { silent = false } = {}) {
   const state = ensureState(tokenId);

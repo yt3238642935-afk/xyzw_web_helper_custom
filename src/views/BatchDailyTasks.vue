@@ -2834,6 +2834,12 @@
 </template>
 
 <script setup>
+
+import { useAutomationScheduler } from "@/stores/automationScheduler";
+
+const automationScheduler = useAutomationScheduler();
+
+
 // Import required dependencies
 import {
   ref,
@@ -4674,6 +4680,11 @@ const executeScheduledTask = async (task) => {
 
     // Wait for all tasks to complete
     await Promise.all(taskPromises);
+
+// 通知外部调度器：日常任务执行阶段完成
+automationScheduler.finishDailyTask();
+
+
 
     addLog({
       time: new Date().toLocaleTimeString(),
