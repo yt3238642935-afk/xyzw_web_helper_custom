@@ -79,3 +79,7 @@ dist.zip
 *.bin
 bin/
 server/config.json
+
+# Local backup files
+*.bak
+*.before_kick_reconnect.bak
