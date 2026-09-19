@@ -192,6 +192,7 @@ export default defineConfig(async () => {
     css: {
       preprocessorOptions: {
         scss: {
+          api: "modern-compiler",
           additionalData: '@use "@/assets/styles/variables.scss" as vars;',
         },
       },

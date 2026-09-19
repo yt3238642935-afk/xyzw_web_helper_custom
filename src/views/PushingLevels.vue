@@ -320,6 +320,10 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useMessage } from "naive-ui";
 import { useTokenStore } from "@/stores/tokenStore";
+import {
+  PREEMPTION_EVENTS,
+  taskPreemptionCoordinator,
+} from "@/utils/taskPreemptionCoordinator";
 import { BOSS_NAMES } from "./boss_names.js";
 
 const MAX_LOGS = 2000;
@@ -327,6 +331,8 @@ const KNOWLEDGE_COIN_ITEM_ID = 1024;
 const TORCH_REFRESH_INTERVAL = 30000;
 const START_STAGGER_MS = 2000;
 const SETTINGS_KEY = "pushing_levels_scheduler_settings_v2";
+const PREEMPTION_SNAPSHOT_KEY = "xyzw_push_preemption_snapshot_v1";
+const SESSION_RESTART_TIMEOUT_MS = 30000;
 // PUSH_SCHEDULER_CYCLIC_ROTATION_V3
 // 达到胜场阈值的账号只让出当前在线名额，并回到候选队尾，不再永久退出。
 
@@ -335,6 +341,7 @@ const STATUS = Object.freeze({
   QUEUED: "queued",
   STARTING: "starting",
   RUNNING: "running",
+  PREEMPTED: "preempted",
   COOLDOWN: "cooldown",
   BLOCKED: "blocked",
   ROTATED: "rotated",
@@ -364,12 +371,21 @@ const torchItemId = ref(1008);
 const torchQuantity = ref(150);
 const logFilterTokenId = ref(null);
 const tickNow = ref(Date.now());
+const preemptionActive = ref(false);
+const preemptionSnapshot = ref(null);
+
+const sessionControllers = new Map();
+const sessionPromises = new Map();
 
 let tickTimer = null;
+let presenceTimer = null;
 let schedulerBusy = false;
 let schedulerPending = false;
 let destroyed = false;
 let runSerial = 0;
+let unsubscribePreemption = null;
+let unsubscribeResume = null;
+let preemptionChain = Promise.resolve();
 
 const torchOptions = [
   { label: "木材火把", value: 1008 },
@@ -464,6 +480,7 @@ function getStatusPresentation(status) {
     [STATUS.QUEUED]: { text: "排队中", type: "info", waiting: "等待在线名额" },
     [STATUS.STARTING]: { text: "连接中", type: "info", waiting: "正在建立连接" },
     [STATUS.RUNNING]: { text: "推图中", type: "success", waiting: "正在推图" },
+    [STATUS.PREEMPTED]: { text: "日常抢占", type: "warning", waiting: "批量日常执行中，等待恢复" },
     [STATUS.COOLDOWN]: { text: "重连冷却", type: "warning", waiting: "异常断线，等待重新排队" },
     [STATUS.BLOCKED]: { text: "失败锁停", type: "error", waiting: "需手动继续，系统不会自动重连" },
     [STATUS.ROTATED]: { text: "轮换中", type: "success", waiting: "已达到胜场阈值，正在回到候选队尾" },
@@ -674,6 +691,7 @@ function createState(tokenId, tokenName) {
     slotHeld: false,
     stopFlag: false,
     manualStopped: false,
+    preempted: false,
     failureLocked: false,
     rotationPending: false,
     connectedOnce: false,
@@ -719,6 +737,7 @@ function resetStateForManualRun(state) {
   state.slotHeld = false;
   state.stopFlag = false;
   state.manualStopped = false;
+  state.preempted = false;
   state.failureLocked = false;
   state.rotationPending = false;
   state.connectedOnce = false;
@@ -883,12 +902,45 @@ function reconnectProgressPercent(card) {
   );
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function createAbortError(reason = "操作已取消") {
+  const message = typeof reason === "string" ? reason : reason?.message || "操作已取消";
+  if (typeof DOMException !== "undefined") {
+    return new DOMException(message, "AbortError");
+  }
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
 }
 
-function isCurrentRun(state, runId) {
-  return Boolean(!destroyed && state && state.runId === runId && !state.stopFlag);
+function isAbortError(error) {
+  return error?.name === "AbortError" || String(error?.message || "").includes("操作已取消");
+}
+
+function sleep(ms, signal = null) {
+  if (signal?.aborted) return Promise.reject(createAbortError(signal.reason));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(createAbortError(signal?.reason));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function isCurrentRun(state, runId, signal = null) {
+  return Boolean(
+    !destroyed
+    && state
+    && state.runId === runId
+    && !state.stopFlag
+    && !state.preempted
+    && !signal?.aborted,
+  );
 }
 
 function isSocketError(error) {
@@ -916,17 +968,34 @@ function setManagedReconnect(tokenId, managed) {
   } catch {}
 }
 
-async function waitConnected(tokenId, state, runId, timeoutMs = 8000) {
+async function closeConnectionAndWait(tokenId) {
+  try {
+    if (typeof tokenStore.closeWebSocketConnectionAsync === "function") {
+      await tokenStore.closeWebSocketConnectionAsync(tokenId);
+      return;
+    }
+    tokenStore.closeWebSocketConnection(tokenId);
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 6000) {
+      if (getWebSocketStatus(tokenId) === "disconnected") return;
+      await sleep(100);
+    }
+  } catch (error) {
+    console.warn(`关闭推图连接失败 [${tokenId}]`, error);
+  }
+}
+
+async function waitConnected(tokenId, state, runId, timeoutMs = 8000, signal = null) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    if (!isCurrentRun(state, runId)) return false;
+    if (!isCurrentRun(state, runId, signal)) return false;
     if (isConnected(tokenId)) return true;
-    await sleep(200);
+    await sleep(200, signal);
   }
   return isConnected(tokenId);
 }
 
-async function connectForPush(tokenId, state, runId) {
+async function connectForPush(tokenId, state, runId, signal) {
   if (isConnected(tokenId)) {
     setManagedReconnect(tokenId, true);
     state.connectedOnce = true;
@@ -939,11 +1008,11 @@ async function connectForPush(tokenId, state, runId) {
   state.status = STATUS.STARTING;
   state.lastError = "";
   await tokenStore.createWebSocketConnection(tokenId, token.token, token.wsUrl);
-  if (!await waitConnected(tokenId, state, runId)) {
+  if (!await waitConnected(tokenId, state, runId, 8000, signal)) {
     throw new Error("WebSocket 连接失败或超时");
   }
 
-  if (!isCurrentRun(state, runId)) return false;
+  if (!isCurrentRun(state, runId, signal)) return false;
   setManagedReconnect(tokenId, true);
   state.connectedOnce = true;
   return true;
@@ -962,9 +1031,11 @@ function removeFromQueue(tokenId) {
 function canAutoQueue(state) {
   return Boolean(
     state
+    && !preemptionActive.value
     && campaignTokenIds.value.includes(state.tokenId)
     && !state.slotHeld
     && !state.manualStopped
+    && !state.preempted
     && !state.failureLocked
     && !state.rotationPending
     && state.status !== STATUS.COOLDOWN,
@@ -992,7 +1063,7 @@ function enqueue(tokenId, { front = false } = {}) {
 }
 
 function requestSchedule() {
-  if (destroyed) return;
+  if (destroyed || preemptionActive.value) return;
   schedulerPending = true;
   queueMicrotask(() => {
     drainQueue().catch((error) => {
@@ -1001,30 +1072,57 @@ function requestSchedule() {
   });
 }
 
+function launchAccountSession(tokenId, state) {
+  const previousController = sessionControllers.get(tokenId);
+  if (previousController && !previousController.signal.aborted) {
+    previousController.abort(createAbortError("创建新的推图会话"));
+  }
+
+  const controller = new AbortController();
+  const runId = ++runSerial;
+  sessionControllers.set(tokenId, controller);
+  state.slotHeld = true;
+  state.running = true;
+  state.status = STATUS.STARTING;
+  state.stopFlag = false;
+  state.preempted = false;
+  state.runId = runId;
+
+  const promise = runAccountSession(tokenId, runId, controller.signal)
+    .catch((error) => {
+      if (!isAbortError(error)) {
+        addLog(tokenId, getTokenName(tokenId), `账号任务异常：${sanitizeError(error)}`, "error");
+      }
+    })
+    .finally(() => {
+      if (sessionControllers.get(tokenId) === controller) {
+        sessionControllers.delete(tokenId);
+      }
+      if (sessionPromises.get(tokenId) === promise) {
+        sessionPromises.delete(tokenId);
+      }
+    });
+
+  sessionPromises.set(tokenId, promise);
+  return { runId, promise };
+}
+
 async function drainQueue() {
-  if (schedulerBusy || destroyed) return;
+  if (schedulerBusy || destroyed || preemptionActive.value) return;
   schedulerBusy = true;
   try {
-    while (!destroyed) {
+    while (!destroyed && !preemptionActive.value) {
       schedulerPending = false;
       let launched = false;
 
-      while (onlineCount.value < safeOnlineLimit.value) {
+      while (!preemptionActive.value && onlineCount.value < safeOnlineLimit.value) {
         const index = queueOrder.value.findIndex((tokenId) => canAutoQueue(runningStates[tokenId]));
         if (index < 0) break;
 
         const [tokenId] = queueOrder.value.splice(index, 1);
         const state = ensureState(tokenId);
-        state.slotHeld = true;
-        state.running = true;
-        state.status = STATUS.STARTING;
-        state.stopFlag = false;
-        state.runId = ++runSerial;
+        launchAccountSession(tokenId, state);
         launched = true;
-
-        runAccountSession(tokenId, state.runId).catch((error) => {
-          addLog(tokenId, getTokenName(tokenId), `账号任务异常：${sanitizeError(error)}`, "error");
-        });
 
         if (onlineCount.value < safeOnlineLimit.value) {
           await sleep(START_STAGGER_MS);
@@ -1041,7 +1139,14 @@ async function drainQueue() {
 }
 
 async function enterReconnectCooldown(state, error) {
-  if (!state || state.manualStopped || state.failureLocked || state.rotationPending) return;
+  if (
+    !state
+    || preemptionActive.value
+    || state.preempted
+    || state.manualStopped
+    || state.failureLocked
+    || state.rotationPending
+  ) return;
   const delayMs = safeReconnectMinutes.value * 60 * 1000;
   state.lastError = sanitizeError(error || "异常断线");
   state.reconnectDelayMs = delayMs;
@@ -1060,11 +1165,12 @@ async function enterReconnectCooldown(state, error) {
   );
   try {
     setManagedReconnect(state.tokenId, true);
-    tokenStore.closeWebSocketConnection(state.tokenId);
+    await closeConnectionAndWait(state.tokenId);
   } catch {}
 }
 
 function processCooldowns() {
+  if (preemptionActive.value) return;
   const now = Date.now();
   Object.values(runningStates).forEach((state) => {
     if (!state || state.status !== STATUS.COOLDOWN) return;
@@ -1081,7 +1187,7 @@ function processCooldowns() {
   });
 }
 
-async function fetchTorchInfo(tokenId, tokenName, { silent = false } = {}) {
+async function fetchTorchInfo(tokenId, tokenName, { silent = false, signal = null } = {}) {
   if (!isConnected(tokenId)) return null;
   try {
     const response = await tokenStore.sendMessageWithPromise(
@@ -1089,6 +1195,7 @@ async function fetchTorchInfo(tokenId, tokenName, { silent = false } = {}) {
       "role_getroleinfo",
       {},
       10000,
+      signal,
     );
     const state = ensureState(tokenId);
     applyTorchInfo(state, readTorchFromResponse(response));
@@ -1104,28 +1211,42 @@ async function fetchTorchInfo(tokenId, tokenName, { silent = false } = {}) {
     }
     return state;
   } catch (error) {
+    if (isAbortError(error)) throw error;
     if (!silent) addLog(tokenId, tokenName, `获取火把信息失败：${sanitizeError(error)}`, "warning");
     return null;
   }
 }
 
-async function initializeBattleData(tokenId, tokenName) {
+async function initializeBattleData(tokenId, tokenName, signal) {
   try {
-    await tokenStore.sendMessageWithPromise(tokenId, "role_getroleinfo", {}, 10000);
-    const response = await tokenStore.sendMessageWithPromise(tokenId, "fight_startlevel", {}, 10000);
+    await tokenStore.sendMessageWithPromise(tokenId, "role_getroleinfo", {}, 10000, signal);
+    const response = await tokenStore.sendMessageWithPromise(
+      tokenId,
+      "fight_startlevel",
+      {},
+      10000,
+      signal,
+    );
     const version = response?.battleData?.version || response?.body?.battleData?.version;
     if (version) {
       tokenStore.setBattleVersion(version);
       addLog(tokenId, tokenName, `battleVersion: ${version}`, "info");
     }
   } catch (error) {
+    if (isAbortError(error)) throw error;
     if (isSocketError(error)) throw error;
     addLog(tokenId, tokenName, `初始化战斗数据失败：${sanitizeError(error)}`, "warning");
   }
 }
 
-async function syncAccountState(tokenId, tokenName, state) {
-  const roleInfo = await tokenStore.sendMessageWithPromise(tokenId, "role_getroleinfo", {}, 10000);
+async function syncAccountState(tokenId, tokenName, state, signal) {
+  const roleInfo = await tokenStore.sendMessageWithPromise(
+    tokenId,
+    "role_getroleinfo",
+    {},
+    10000,
+    signal,
+  );
   const body = responseBody(roleInfo);
   const level = pickNumber(body.levelId, body.body?.levelId, body.currLevel);
   if (level !== null) {
@@ -1134,20 +1255,33 @@ async function syncAccountState(tokenId, tokenName, state) {
   }
 
   try {
-    const levelInfo = await tokenStore.sendMessageWithPromise(tokenId, "fight_level", {}, 10000);
+    const levelInfo = await tokenStore.sendMessageWithPromise(
+      tokenId,
+      "fight_level",
+      {},
+      10000,
+      signal,
+    );
     const bossName = levelInfo?.bossName || levelInfo?.body?.bossName || levelInfo?.role?.bossName || "";
     applyLevel(state, level || state.level, bossName);
   } catch (error) {
+    if (isAbortError(error)) throw error;
     if (isSocketError(error)) throw error;
     addLog(tokenId, tokenName, `获取BOSS信息失败：${sanitizeError(error)}`, "info");
   }
 
-  await fetchTorchInfo(tokenId, tokenName, { silent: true });
+  await fetchTorchInfo(tokenId, tokenName, { silent: true, signal });
 }
 
-async function upgradeHangupReward(tokenId, tokenName, state, runId) {
+async function upgradeHangupReward(tokenId, tokenName, state, runId, signal) {
   try {
-    const roleInfo = await tokenStore.sendMessageWithPromise(tokenId, "role_getroleinfo", {}, 5000);
+    const roleInfo = await tokenStore.sendMessageWithPromise(
+      tokenId,
+      "role_getroleinfo",
+      {},
+      5000,
+      signal,
+    );
     const items = roleInfo?.role?.items || roleInfo?.body?.role?.items || roleInfo?.items || [];
     let coinCount = 0;
     if (Array.isArray(items)) {
@@ -1158,20 +1292,22 @@ async function upgradeHangupReward(tokenId, tokenName, state, runId) {
     }
 
     let used = 0;
-    while (coinCount > 0 && isCurrentRun(state, runId) && isConnected(tokenId)) {
+    while (coinCount > 0 && isCurrentRun(state, runId, signal) && isConnected(tokenId)) {
       const upgradeNum = coinCount >= 50 ? 50 : coinCount >= 10 ? 10 : 1;
       await tokenStore.sendMessageWithPromise(
         tokenId,
         "system_hangupupgrade",
         { upgradeNum },
         5000,
+        signal,
       );
       coinCount -= upgradeNum;
       used += upgradeNum;
-      await sleep(1200);
+      await sleep(1200, signal);
     }
     if (used > 0) addLog(tokenId, tokenName, `升级挂机奖励完成，共用 ${used} 个知识币`, "success");
   } catch (error) {
+    if (isAbortError(error)) throw error;
     if (isSocketError(error)) throw error;
     addLog(tokenId, tokenName, `升级挂机奖励异常：${sanitizeError(error)}`, "warning");
   }
@@ -1219,8 +1355,8 @@ function rotateAfterWins(state) {
   );
 }
 
-async function runOneBattle(tokenId, tokenName, state, runId) {
-  if (!isCurrentRun(state, runId)) return { stopped: true };
+async function runOneBattle(tokenId, tokenName, state, runId, signal) {
+  if (!isCurrentRun(state, runId, signal)) return { stopped: true };
   if (!isConnected(tokenId)) return { disconnected: true, error: "WebSocket 已断开" };
 
   let battleTime = 0;
@@ -1230,6 +1366,7 @@ async function runOneBattle(tokenId, tokenName, state, runId) {
       "fight_calcleveltime",
       {},
       15000,
+      signal,
     );
     const body = responseBody(response);
     battleTime = pickNumber(body.battleTime, body.body?.battleTime) || 0;
@@ -1238,6 +1375,7 @@ async function runOneBattle(tokenId, tokenName, state, runId) {
     if (syncedLevel !== null) applyLevel(state, syncedLevel, syncedBossName);
     else applyLevel(state, state.level, syncedBossName);
   } catch (error) {
+    if (isAbortError(error)) return { stopped: true };
     if (isSocketError(error) || !isConnected(tokenId)) {
       return { disconnected: true, error };
     }
@@ -1261,17 +1399,23 @@ async function runOneBattle(tokenId, tokenName, state, runId) {
 
   if (state.level > 0 && state.level % 100 === 1) {
     try {
-      await upgradeHangupReward(tokenId, tokenName, state, runId);
+      await upgradeHangupReward(tokenId, tokenName, state, runId, signal);
     } catch (error) {
+      if (isAbortError(error)) return { stopped: true };
       return { disconnected: true, error };
     }
   }
 
   const startedAt = Date.now();
   let heartbeatTick = 0;
-  while (state.countdown > 0 && isCurrentRun(state, runId)) {
-    await sleep(1000);
-    if (!isCurrentRun(state, runId)) return { stopped: true };
+  while (state.countdown > 0 && isCurrentRun(state, runId, signal)) {
+    try {
+      await sleep(1000, signal);
+    } catch (error) {
+      if (isAbortError(error)) return { stopped: true };
+      throw error;
+    }
+    if (!isCurrentRun(state, runId, signal)) return { stopped: true };
     if (!isConnected(tokenId)) return { disconnected: true, error: "战斗中连接断开" };
     heartbeatTick += 1;
     state.countdown = Math.max(
@@ -1285,10 +1429,16 @@ async function runOneBattle(tokenId, tokenName, state, runId) {
     }
   }
 
-  if (!isCurrentRun(state, runId)) return { stopped: true };
+  if (!isCurrentRun(state, runId, signal)) return { stopped: true };
 
   try {
-    const response = await tokenStore.sendMessageWithPromise(tokenId, "fight_level", {}, 15000);
+    const response = await tokenStore.sendMessageWithPromise(
+      tokenId,
+      "fight_level",
+      {},
+      15000,
+      signal,
+    );
     const body = responseBody(response);
     const success = Boolean(body.success || body.isWin);
     const nextLevel = pickNumber(body.currLevel, body.nextLevel, body.levelId);
@@ -1303,7 +1453,7 @@ async function runOneBattle(tokenId, tokenName, state, runId) {
       state.lastError = "";
       applyLevel(state, nextLevel || state.level + 1, nextBossName);
       addLog(tokenId, tokenName, `胜利，当前关卡 ${state.level}`, "success");
-      fetchTorchInfo(tokenId, tokenName, { silent: true }).catch(() => {});
+      fetchTorchInfo(tokenId, tokenName, { silent: true, signal }).catch(() => {});
       return { success: true };
     }
 
@@ -1321,6 +1471,7 @@ async function runOneBattle(tokenId, tokenName, state, runId) {
     );
     return { success: false };
   } catch (error) {
+    if (isAbortError(error)) return { stopped: true };
     if (isSocketError(error) || !isConnected(tokenId)) {
       return { disconnected: true, error };
     }
@@ -1334,36 +1485,36 @@ async function runOneBattle(tokenId, tokenName, state, runId) {
   }
 }
 
-async function runAccountSession(tokenId, runId) {
+async function runAccountSession(tokenId, runId, signal) {
   const state = ensureState(tokenId);
   const tokenName = state.tokenName;
   state.startTime = state.startTime || Date.now();
   addLog(tokenId, tokenName, state.reconnectAttempts > 0 ? "开始自动重连并恢复推图" : "开始推图", "success");
 
   try {
-    if (!await connectForPush(tokenId, state, runId)) return;
-    if (!isCurrentRun(state, runId)) return;
+    if (!await connectForPush(tokenId, state, runId, signal)) return;
+    if (!isCurrentRun(state, runId, signal)) return;
 
-    await initializeBattleData(tokenId, tokenName);
-    if (!isCurrentRun(state, runId)) return;
-    await syncAccountState(tokenId, tokenName, state);
-    if (!isCurrentRun(state, runId)) return;
+    await initializeBattleData(tokenId, tokenName, signal);
+    if (!isCurrentRun(state, runId, signal)) return;
+    await syncAccountState(tokenId, tokenName, state, signal);
+    if (!isCurrentRun(state, runId, signal)) return;
 
     state.status = STATUS.RUNNING;
     state.lastError = "";
     addLog(tokenId, tokenName, "连接及关卡同步完成，开始主线循环", "info");
 
-    while (isCurrentRun(state, runId)) {
+    while (isCurrentRun(state, runId, signal)) {
       if (!isConnected(tokenId)) {
         await enterReconnectCooldown(state, "WebSocket 异常断开");
         break;
       }
 
       if (Date.now() - (state.lastTorchFetch || 0) > TORCH_REFRESH_INTERVAL) {
-        fetchTorchInfo(tokenId, tokenName, { silent: true }).catch(() => {});
+        fetchTorchInfo(tokenId, tokenName, { silent: true, signal }).catch(() => {});
       }
 
-      const result = await runOneBattle(tokenId, tokenName, state, runId);
+      const result = await runOneBattle(tokenId, tokenName, state, runId, signal);
       if (result.stopped || state.failureLocked || state.rotationPending || state.manualStopped) break;
       if (result.disconnected) {
         await enterReconnectCooldown(state, result.error);
@@ -1393,33 +1544,54 @@ async function runAccountSession(tokenId, runId) {
         break;
       }
 
-      await sleep(result.success ? 2000 : 3000);
+      await sleep(result.success ? 2000 : 3000, signal);
     }
   } catch (error) {
-    if (isCurrentRun(state, runId) || (!state.manualStopped && !state.failureLocked && !state.rotationPending)) {
+    if (isAbortError(error) || state.preempted || preemptionActive.value) {
+      // 抢占或手动停止属于预期控制流，不进入异常重连。
+    } else if (
+      isCurrentRun(state, runId, signal)
+      || (!state.manualStopped && !state.failureLocked && !state.rotationPending)
+    ) {
       await enterReconnectCooldown(state, error);
     }
   } finally {
     if (state.runId !== runId) return;
+    const wasPreempted = Boolean(state.preempted && preemptionActive.value);
     const shouldRequeueAfterRotation = Boolean(
       state.rotationPending
       && !state.manualStopped
       && !state.failureLocked
       && campaignTokenIds.value.includes(tokenId)
-      && !destroyed,
+      && !destroyed
+      && !preemptionActive.value,
     );
     const completedRoundWins = Number(state.roundWins || 0);
     state.slotHeld = false;
     state.running = false;
-    if (state.status !== STATUS.COOLDOWN && state.status !== STATUS.BLOCKED && state.status !== STATUS.ROTATED) {
+    if (wasPreempted) {
+      state.status = STATUS.PREEMPTED;
+      state.stopFlag = true;
+      state.countdown = 0;
+      state.lastError = "批量日常任务抢占，等待恢复";
+    } else if (
+      state.status !== STATUS.COOLDOWN
+      && state.status !== STATUS.BLOCKED
+      && state.status !== STATUS.ROTATED
+    ) {
       if (state.manualStopped || state.stopFlag) state.status = STATUS.STOPPED;
     }
     if (state.status !== STATUS.COOLDOWN) state.countdown = 0;
 
     try {
       setManagedReconnect(tokenId, true);
-      tokenStore.closeWebSocketConnection(tokenId);
+      await closeConnectionAndWait(tokenId);
     } catch {}
+
+    if (wasPreempted) {
+      addLog(tokenId, tokenName, "推图会话已中断并释放连接，等待批量日常完成", "warning");
+      return;
+    }
 
     const elapsed = state.startTime ? Math.round((Date.now() - state.startTime) / 1000) : 0;
     addLog(
@@ -1445,8 +1617,320 @@ async function runAccountSession(tokenId, runId) {
   }
 }
 
+const SNAPSHOT_STATE_FIELDS = [
+  "status",
+  "manualStopped",
+  "failureLocked",
+  "rotationPending",
+  "level",
+  "bossName",
+  "bossLevel",
+  "wins",
+  "roundWins",
+  "losses",
+  "sameLevelFailures",
+  "failureLevel",
+  "battles",
+  "totalTime",
+  "lastError",
+  "startTime",
+  "consecutiveErrors",
+  "reconnectAt",
+  "reconnectDelayMs",
+  "reconnectAttempts",
+  "torchType",
+  "torchTypeName",
+  "torchRemaining",
+  "torchSettleTime",
+  "torchActive",
+  "torchBaseTimestamp",
+  "torchBaseRemaining",
+  "lastTorchFetch",
+];
+
+function snapshotState(state) {
+  return SNAPSHOT_STATE_FIELDS.reduce((result, field) => {
+    result[field] = state?.[field];
+    return result;
+  }, {});
+}
+
+function buildPreemptionSnapshot(payload) {
+  const campaignIds = [...campaignTokenIds.value];
+  const activeTokenIds = campaignIds.filter((tokenId) => {
+    const state = runningStates[tokenId];
+    return Boolean(
+      state?.slotHeld
+      || state?.running
+      || state?.status === STATUS.STARTING
+      || state?.status === STATUS.RUNNING,
+    );
+  });
+
+  return {
+    version: 1,
+    requestId: payload.requestId,
+    requestIds: [payload.requestId],
+    taskId: payload.taskId || null,
+    taskName: payload.taskName || "批量日常",
+    createdAt: Date.now(),
+    campaignTokenIds: campaignIds,
+    selectedTokenIds: [...selectedTokenIds.value],
+    queueOrder: [...queueOrder.value],
+    activeTokenIds,
+    settings: {
+      autoContinue: autoContinue.value,
+      onlineAccountLimit: safeOnlineLimit.value,
+      sameLevelFailureLimit: safeFailureLimit.value,
+      winRotationLimit: safeWinLimit.value,
+      reconnectDelayMinutes: safeReconnectMinutes.value,
+    },
+    states: Object.fromEntries(
+      campaignIds.map((tokenId) => [tokenId, snapshotState(ensureState(tokenId))]),
+    ),
+  };
+}
+
+function persistPreemptionSnapshot(snapshot) {
+  try {
+    sessionStorage.setItem(PREEMPTION_SNAPSHOT_KEY, JSON.stringify(snapshot));
+  } catch (error) {
+    console.warn("保存推图抢占快照失败", error);
+  }
+}
+
+function clearPreemptionSnapshot() {
+  preemptionSnapshot.value = null;
+  try {
+    sessionStorage.removeItem(PREEMPTION_SNAPSHOT_KEY);
+  } catch {}
+}
+
+function updatePushPresence() {
+  taskPreemptionCoordinator.setPushPresence({
+    active: campaignTokenIds.value.length > 0 && !preemptionActive.value,
+    preempted: preemptionActive.value && Boolean(preemptionSnapshot.value),
+    campaignSize: campaignTokenIds.value.length,
+  });
+}
+
+function serializePreemptionOperation(operation) {
+  const next = preemptionChain.then(operation, operation);
+  preemptionChain = next.catch(() => {});
+  return next;
+}
+
+async function preemptPushSessions(payload) {
+  if (preemptionActive.value && preemptionSnapshot.value) {
+    if (!preemptionSnapshot.value.requestIds.includes(payload.requestId)) {
+      preemptionSnapshot.value.requestIds.push(payload.requestId);
+      persistPreemptionSnapshot(preemptionSnapshot.value);
+    }
+    return {
+      requestId: payload.requestId,
+      acknowledged: true,
+      ready: true,
+      hadActivePush: preemptionSnapshot.value.campaignTokenIds.length > 0,
+      activeTokenIds: [...preemptionSnapshot.value.activeTokenIds],
+    };
+  }
+
+  if (!campaignTokenIds.value.length) {
+    return {
+      requestId: payload.requestId,
+      acknowledged: true,
+      ready: true,
+      hadActivePush: false,
+      activeTokenIds: [],
+    };
+  }
+
+  const snapshot = buildPreemptionSnapshot(payload);
+  preemptionActive.value = true;
+  preemptionSnapshot.value = snapshot;
+  persistPreemptionSnapshot(snapshot);
+  queueOrder.value = [];
+  schedulerPending = false;
+
+  addLog(
+    "system",
+    "系统",
+    `定时任务「${snapshot.taskName}」即将执行，正在中断 ${snapshot.activeTokenIds.length} 个推图会话`,
+    "warning",
+  );
+
+  snapshot.campaignTokenIds.forEach((tokenId) => {
+    const state = ensureState(tokenId);
+    if (state.failureLocked || state.manualStopped) return;
+    state.preempted = true;
+    state.stopFlag = true;
+    state.running = false;
+    state.status = STATUS.PREEMPTED;
+    state.countdown = 0;
+    const controller = sessionControllers.get(tokenId);
+    if (controller && !controller.signal.aborted) {
+      controller.abort(createAbortError("批量日常任务抢占"));
+    }
+  });
+
+  const runningPromises = snapshot.activeTokenIds
+    .map((tokenId) => sessionPromises.get(tokenId))
+    .filter(Boolean);
+  await Promise.allSettled(runningPromises);
+
+  // runAccountSession 的 finally 已关闭连接；这里再次确认，避免旧 Session 残留。
+  for (const tokenId of snapshot.activeTokenIds) {
+    await closeConnectionAndWait(tokenId);
+    const state = ensureState(tokenId);
+    state.slotHeld = false;
+    state.running = false;
+    state.status = STATUS.PREEMPTED;
+  }
+
+  updatePushPresence();
+  return {
+    requestId: payload.requestId,
+    acknowledged: true,
+    ready: true,
+    hadActivePush: snapshot.campaignTokenIds.length > 0,
+    activeTokenIds: [...snapshot.activeTokenIds],
+  };
+}
+
+async function waitForSessionRestart(state, runId, timeoutMs = SESSION_RESTART_TIMEOUT_MS) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (state.runId !== runId) return false;
+    if (state.status === STATUS.RUNNING && isConnected(state.tokenId)) return true;
+    if ([STATUS.COOLDOWN, STATUS.BLOCKED, STATUS.STOPPED].includes(state.status)) return false;
+    await sleep(200);
+  }
+  return state.status === STATUS.RUNNING && isConnected(state.tokenId);
+}
+
+async function resumePushSessions(payload) {
+  const snapshot = preemptionSnapshot.value;
+  if (!snapshot || !snapshot.requestIds.includes(payload.requestId)) {
+    return {
+      requestId: payload.requestId,
+      resumed: false,
+      reason: "snapshot-not-found",
+    };
+  }
+
+  const validCampaignIds = snapshot.campaignTokenIds.filter((tokenId) => {
+    const state = ensureState(tokenId);
+    const savedState = snapshot.states[tokenId] || {};
+    const stoppedWhilePreempted = state.manualStopped && !savedState.manualStopped;
+    return Boolean(getToken(tokenId) && !stoppedWhilePreempted);
+  });
+
+  campaignTokenIds.value = [...validCampaignIds];
+  selectedTokenIds.value = snapshot.selectedTokenIds.filter((tokenId) => getToken(tokenId));
+  queueOrder.value = [];
+
+  validCampaignIds.forEach((tokenId) => {
+    const state = ensureState(tokenId);
+    const savedState = snapshot.states[tokenId];
+    if (savedState) Object.assign(state, savedState);
+    state.slotHeld = false;
+    state.running = false;
+    state.countdown = 0;
+    state.preempted = false;
+    state.stopFlag = false;
+  });
+
+  const activeIds = snapshot.activeTokenIds.filter((tokenId) => {
+    const state = runningStates[tokenId];
+    return validCampaignIds.includes(tokenId) && state && !state.failureLocked && !state.manualStopped;
+  });
+
+  let resumedCount = 0;
+  for (const tokenId of activeIds) {
+    const state = ensureState(tokenId);
+    await closeConnectionAndWait(tokenId);
+    const { runId } = launchAccountSession(tokenId, state);
+    const ready = await waitForSessionRestart(state, runId);
+    if (ready) resumedCount += 1;
+    await sleep(300);
+  }
+
+  const activeSet = new Set(activeIds);
+  const savedQueue = snapshot.queueOrder.filter(
+    (tokenId) => validCampaignIds.includes(tokenId) && !activeSet.has(tokenId),
+  );
+  const remainingIds = validCampaignIds.filter(
+    (tokenId) => !activeSet.has(tokenId) && !savedQueue.includes(tokenId),
+  );
+
+  preemptionActive.value = false;
+  [...savedQueue, ...remainingIds].forEach((tokenId) => {
+    const state = ensureState(tokenId);
+    state.preempted = false;
+    if (state.failureLocked) {
+      state.status = STATUS.BLOCKED;
+      return;
+    }
+    if (state.status === STATUS.COOLDOWN && Number(state.reconnectAt || 0) > Date.now()) return;
+    state.status = STATUS.IDLE;
+    state.stopFlag = false;
+    enqueue(tokenId);
+  });
+
+  clearPreemptionSnapshot();
+  updatePushPresence();
+  requestSchedule();
+  addLog(
+    "system",
+    "系统",
+    `批量日常已结束，已串行重建 ${resumedCount}/${activeIds.length} 个推图会话`,
+    "success",
+  );
+
+  return {
+    requestId: payload.requestId,
+    resumed: true,
+    resumedCount,
+    activeCount: activeIds.length,
+  };
+}
+
+function handlePreemptionRequest(payload) {
+  serializePreemptionOperation(() => preemptPushSessions(payload))
+    .then((result) => {
+      taskPreemptionCoordinator.publish(PREEMPTION_EVENTS.PREEMPT_READY, result);
+    })
+    .catch((error) => {
+      taskPreemptionCoordinator.publish(PREEMPTION_EVENTS.PREEMPT_READY, {
+        requestId: payload.requestId,
+        acknowledged: true,
+        ready: false,
+        hadActivePush: true,
+        error: sanitizeError(error),
+      });
+    });
+}
+
+function handleResumeRequest(payload) {
+  serializePreemptionOperation(() => resumePushSessions(payload))
+    .then((result) => {
+      taskPreemptionCoordinator.publish(PREEMPTION_EVENTS.RESUME_COMPLETE, result);
+    })
+    .catch((error) => {
+      taskPreemptionCoordinator.publish(PREEMPTION_EVENTS.RESUME_COMPLETE, {
+        requestId: payload.requestId,
+        resumed: false,
+        error: sanitizeError(error),
+      });
+    });
+}
+
 function startSelected() {
   if (!selectedTokenIds.value.length) return;
+  if (preemptionActive.value) {
+    message.warning("批量日常正在抢占推图，请等待任务完成后再启动");
+    return;
+  }
   let queued = 0;
   let skipped = 0;
   selectedTokenIds.value.forEach((tokenId) => {
@@ -1462,11 +1946,16 @@ function startSelected() {
     if (enqueue(tokenId)) queued += 1;
   });
   message.success(`已加入推图队列 ${queued} 个${skipped ? `，失败锁停跳过 ${skipped} 个` : ""}`);
+  updatePushPresence();
   requestSchedule();
 }
 
 function manualContinue(tokenId) {
   const state = ensureState(tokenId);
+  const controller = sessionControllers.get(tokenId);
+  if (controller && !controller.signal.aborted) {
+    controller.abort(createAbortError("手动重新启动推图"));
+  }
   state.runId = ++runSerial;
   removeFromQueue(tokenId);
   try {
@@ -1480,6 +1969,10 @@ function manualContinue(tokenId) {
 
 function stopOne(tokenId, { silent = false } = {}) {
   const state = ensureState(tokenId);
+  const controller = sessionControllers.get(tokenId);
+  if (controller && !controller.signal.aborted) {
+    controller.abort(createAbortError("手动停止推图"));
+  }
   state.runId = ++runSerial;
   state.stopFlag = true;
   state.manualStopped = true;
@@ -1495,6 +1988,7 @@ function stopOne(tokenId, { silent = false } = {}) {
     setManagedReconnect(tokenId, true);
     tokenStore.closeWebSocketConnection(tokenId);
   } catch {}
+  updatePushPresence();
   requestSchedule();
 }
 
@@ -1522,12 +2016,16 @@ function canManualContinue(card) {
 }
 
 function canStopCard(card) {
-  return [STATUS.QUEUED, STATUS.STARTING, STATUS.RUNNING, STATUS.COOLDOWN]
+  return [STATUS.QUEUED, STATUS.STARTING, STATUS.RUNNING, STATUS.PREEMPTED, STATUS.COOLDOWN]
     .includes(card.status);
 }
 
 async function useTorchForSelected() {
   if (!selectedTokenIds.value.length) return;
+  if (preemptionActive.value) {
+    message.warning("批量日常正在执行，暂时不能使用火把");
+    return;
+  }
   const option = torchOptions.find((item) => item.value === torchItemId.value);
   const itemName = option?.label || `#${torchItemId.value}`;
   const quantity = clampInteger(torchQuantity.value, 1, 999, 1);
@@ -1590,7 +2088,18 @@ async function useTorchForSelected() {
 }
 
 onMounted(() => {
+  destroyed = false;
   loadSettings();
+  unsubscribePreemption = taskPreemptionCoordinator.subscribe(
+    PREEMPTION_EVENTS.PREEMPT_REQUEST,
+    handlePreemptionRequest,
+  );
+  unsubscribeResume = taskPreemptionCoordinator.subscribe(
+    PREEMPTION_EVENTS.RESUME_REQUEST,
+    handleResumeRequest,
+  );
+  updatePushPresence();
+  presenceTimer = setInterval(updatePushPresence, 5000);
   tickTimer = setInterval(() => {
     tickNow.value = Date.now();
     processCooldowns();
@@ -1599,6 +2108,15 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   destroyed = true;
+  unsubscribePreemption?.();
+  unsubscribeResume?.();
+  unsubscribePreemption = null;
+  unsubscribeResume = null;
+  if (presenceTimer) {
+    clearInterval(presenceTimer);
+    presenceTimer = null;
+  }
+  taskPreemptionCoordinator.clearPushPresence();
   if (tickTimer) {
     clearInterval(tickTimer);
     tickTimer = null;
@@ -1610,6 +2128,10 @@ onBeforeUnmount(() => {
       state.runId = ++runSerial;
       state.stopFlag = true;
       state.manualStopped = true;
+    }
+    const controller = sessionControllers.get(tokenId);
+    if (controller && !controller.signal.aborted) {
+      controller.abort(createAbortError("推图页面卸载"));
     }
     try {
       tokenStore.closeWebSocketConnection(tokenId);

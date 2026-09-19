@@ -969,12 +969,30 @@ export const useTokenStore = defineStore("tokens", () => {
   };
 
   // Promise版发送消息
+  const createAbortError = (reason: any = "操作已取消") => {
+    const message =
+      typeof reason === "string"
+        ? reason
+        : reason?.message || "操作已取消";
+    if (typeof DOMException !== "undefined") {
+      return new DOMException(message, "AbortError");
+    }
+    const error = new Error(message);
+    error.name = "AbortError";
+    return error;
+  };
+
   const sendMessageWithPromise = async (
     tokenId: string,
     cmd: string,
     params = {},
     timeout = 5000,
+    signal: AbortSignal | null = null,
   ) => {
+    if (signal?.aborted) {
+      return Promise.reject(createAbortError(signal.reason));
+    }
+
     const connection = wsConnections.value[tokenId];
     if (!connection || connection.status !== "connected") {
       return Promise.reject(new Error(`WebSocket未连接 [${tokenId}]`));
@@ -1003,8 +1021,18 @@ export const useTokenStore = defineStore("tokens", () => {
       );
     }
 
+    let abortHandler: (() => void) | null = null;
     try {
-      const result = await client.sendWithPromise(cmd, params, timeout);
+      const requestPromise = client.sendWithPromise(cmd, params, timeout);
+      const result = signal
+        ? await Promise.race([
+            requestPromise,
+            new Promise((_, reject) => {
+              abortHandler = () => reject(createAbortError(signal.reason));
+              signal.addEventListener("abort", abortHandler, { once: true });
+            }),
+          ])
+        : await requestPromise;
 
       // 特殊日志：fight_starttower 响应
       if (cmd === "fight_starttower") {
@@ -1018,6 +1046,10 @@ export const useTokenStore = defineStore("tokens", () => {
         wsLogger.error(`🗼 [咸将塔] 爬塔请求失败 [${tokenId}]:`, error.message);
       }
       return Promise.reject(error);
+    } finally {
+      if (signal && abortHandler) {
+        signal.removeEventListener("abort", abortHandler);
+      }
     }
   };
 
@@ -1594,6 +1626,7 @@ export const useTokenStore = defineStore("tokens", () => {
     // WebSocket方法
     createWebSocketConnection,
     closeWebSocketConnection,
+    closeWebSocketConnectionAsync,
     getWebSocketStatus,
     getWebSocketClient,
     sendMessage,

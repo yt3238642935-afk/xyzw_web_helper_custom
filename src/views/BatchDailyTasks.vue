@@ -2848,6 +2848,7 @@ import {
 import { useTokenStore, gameTokens, tokenGroups } from "@/stores/tokenStore";
 import { $emit } from "@/stores/events/index.ts";
 import { DailyTaskRunner } from "@/utils/dailyTaskRunner";
+import { taskPreemptionCoordinator } from "@/utils/taskPreemptionCoordinator";
 import { preloadQuestions } from "@/utils/studyQuestionsFromJSON.js";
 import { useMessage } from "naive-ui";
 import { Settings } from "@vicons/ionicons5";
@@ -4077,6 +4078,164 @@ const importConfig = async ({ file }) => {
 
 // 注: parseCronField, calculateNextExecutionTime, formatTimeDifference 已从 @/utils/batch 导入
 
+const PREEMPTION_LEAD_MS = 2 * 60 * 1000;
+const PREEMPTION_ACK_TIMEOUT_MS = 30000;
+const PREEMPTION_RESUME_TIMEOUT_MS = 60000;
+let preparedPreemption = null;
+let scheduledExecutionChain = Promise.resolve();
+let scheduledQueueDepth = 0;
+
+const createPreemptionEntry = (task, scheduledAt, source) => {
+  const requestId = taskPreemptionCoordinator.createRequestId("daily");
+  const entry = {
+    requestId,
+    taskId: task.id,
+    taskName: task.name,
+    scheduledAt,
+    source,
+    claimed: false,
+    response: null,
+    promise: null,
+  };
+
+  entry.promise = taskPreemptionCoordinator
+    .requestPreemption(
+      {
+        requestId,
+        taskId: task.id,
+        taskName: task.name,
+        scheduledAt,
+        selectedTokens: [...(task.selectedTokens || [])],
+      },
+      PREEMPTION_ACK_TIMEOUT_MS,
+    )
+    .then((response) => {
+      if (response?.ready === false) {
+        throw new Error(response.error || "推图会话未能完成抢占");
+      }
+      entry.response = response;
+      if (response?.hadActivePush) {
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `=== 已暂停主线推图，等待执行定时任务: ${task.name} ===`,
+          type: "warning",
+        });
+      }
+      return response;
+    });
+
+  return entry;
+};
+
+const prepareScheduledPreemption = (task, scheduledAt) => {
+  if (!taskPreemptionCoordinator.hasActivePushPresence()) return;
+
+  if (
+    preparedPreemption
+    && Math.abs(Number(preparedPreemption.scheduledAt) - Number(scheduledAt)) <= PREEMPTION_LEAD_MS
+  ) {
+    return;
+  }
+
+  if (preparedPreemption?.response?.hadActivePush && !preparedPreemption.claimed) {
+    // 配置发生变化时先归还旧租约，防止推图长期停留在抢占状态。
+    taskPreemptionCoordinator
+      .requestResume(
+        { requestId: preparedPreemption.requestId, reason: "schedule-replaced" },
+        PREEMPTION_RESUME_TIMEOUT_MS,
+      )
+      .catch((error) => console.error("释放旧推图抢占租约失败", error));
+  }
+
+  preparedPreemption = createPreemptionEntry(task, scheduledAt, "lead-time");
+  preparedPreemption.promise.catch((error) => {
+    addLog({
+      time: new Date().toLocaleTimeString(),
+      message: `=== 定时任务抢占准备失败: ${error.message} ===`,
+      type: "error",
+    });
+  });
+};
+
+const acquireTaskPreemption = async (task, isScheduledExecution) => {
+  const now = Date.now();
+  if (
+    preparedPreemption
+    && Math.abs(now - Number(preparedPreemption.scheduledAt || now)) <= 3 * 60 * 1000
+  ) {
+    preparedPreemption.claimed = true;
+    await preparedPreemption.promise;
+    return preparedPreemption;
+  }
+
+  if (!taskPreemptionCoordinator.hasActivePushPresence()) return null;
+
+  const entry = createPreemptionEntry(task, now, isScheduledExecution ? "scheduled-now" : "manual");
+  entry.claimed = true;
+  await entry.promise;
+  if (isScheduledExecution) preparedPreemption = entry;
+  return entry;
+};
+
+const releasePreemptionLease = async (entry, reason = "task-finished") => {
+  if (!entry) return;
+  let response = entry.response;
+  if (!response && entry.promise) {
+    try {
+      response = await entry.promise;
+    } catch {
+      response = null;
+    }
+  }
+
+  if (response?.hadActivePush) {
+    const result = await taskPreemptionCoordinator.requestResume(
+      { requestId: entry.requestId, reason },
+      PREEMPTION_RESUME_TIMEOUT_MS,
+    );
+    if (result?.resumed === false && result?.reason !== "snapshot-not-found") {
+      throw new Error(result?.error || "恢复主线推图失败");
+    }
+    addLog({
+      time: new Date().toLocaleTimeString(),
+      message: "=== 批量日常结束，主线推图恢复指令已完成 ===",
+      type: "success",
+    });
+  }
+
+  if (preparedPreemption?.requestId === entry.requestId) {
+    preparedPreemption = null;
+  }
+};
+
+const enqueueScheduledTask = (task, executionKey) => {
+  scheduledQueueDepth += 1;
+  scheduledExecutionChain = scheduledExecutionChain
+    .then(() => executeScheduledTask(task, { scheduled: true, executionKey }))
+    .catch((error) => {
+      addLog({
+        time: new Date().toLocaleTimeString(),
+        message: `=== 定时任务队列执行失败: ${error.message} ===`,
+        type: "error",
+      });
+    })
+    .finally(async () => {
+      scheduledQueueDepth = Math.max(0, scheduledQueueDepth - 1);
+      if (scheduledQueueDepth === 0 && preparedPreemption) {
+        const entry = preparedPreemption;
+        try {
+          await releasePreemptionLease(entry);
+        } catch (error) {
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `=== 主线推图恢复失败: ${error.message} ===`,
+            type: "error",
+          });
+        }
+      }
+    });
+};
+
 // Task countdowns ref
 const taskCountdowns = ref({});
 const nextExecutionTimes = ref({});
@@ -4084,6 +4243,8 @@ const nextExecutionTimes = ref({});
 // Update countdowns for all tasks
 const updateCountdowns = () => {
   const now = Date.now();
+  let nearestTask = null;
+  let nearestExecutionTime = Infinity;
 
   scheduledTasks.value.forEach((task) => {
     if (!task.enabled) {
@@ -4107,8 +4268,27 @@ const updateCountdowns = () => {
         formatted: formatTimeDifference(Math.max(0, timeDiff)),
         isNearExecution: timeDiff < 5 * 60 * 1000, // Less than 5 minutes
       };
+      if (timeDiff > 0 && timeDiff < nearestExecutionTime) {
+        nearestTask = task;
+        nearestExecutionTime = timeDiff;
+      }
     }
   });
+
+  if (nearestTask && nearestExecutionTime <= PREEMPTION_LEAD_MS) {
+    prepareScheduledPreemption(nearestTask, nextExecutionTimes.value[nearestTask.id]);
+  }
+
+  if (
+    preparedPreemption
+    && !preparedPreemption.claimed
+    && now > Number(preparedPreemption.scheduledAt || 0) + 60 * 1000
+  ) {
+    const staleEntry = preparedPreemption;
+    releasePreemptionLease(staleEntry, "schedule-missed").catch((error) => {
+      console.error("释放过期推图抢占租约失败", error);
+    });
+  }
 };
 
 // 计算最短倒计时任务
@@ -4305,7 +4485,7 @@ const startScheduler = () => {
 
             // Execute the task
             lastTaskExecution = Date.now();
-            executeScheduledTask(task);
+            enqueueScheduledTask(task, taskExecutionKey);
           } else {
             // Only log once per minute to avoid spamming logs
             // But since we check every 10s, this might log multiple times if we don't track logged state
@@ -4349,6 +4529,11 @@ onMounted(() => {
 
 // Cleanup countdown interval on unmount
 onBeforeUnmount(() => {
+  if (preparedPreemption) {
+    releasePreemptionLease(preparedPreemption, "batch-page-unmounted").catch((error) => {
+      console.error("批量日常页面卸载时恢复推图失败", error);
+    });
+  }
   if (countdownInterval) {
     clearInterval(countdownInterval);
     countdownInterval = null;
@@ -4518,7 +4703,11 @@ const resolveScheduledTaskFunction = (taskName) => {
 };
 
 // Execute a scheduled task with dependency verification
-const executeScheduledTask = async (task) => {
+const executeScheduledTask = async (task, options = {}) => {
+  const isScheduledExecution = options.scheduled === true;
+  let preemptionLease = null;
+  let availableTokens = [];
+
   addLog({
     time: new Date().toLocaleTimeString(),
     message: `=== 开始执行定时任务: ${task.name} ===`,
@@ -4526,6 +4715,8 @@ const executeScheduledTask = async (task) => {
   });
 
   try {
+    preemptionLease = await acquireTaskPreemption(task, isScheduledExecution);
+
     // Verify dependencies before executing task
     const dependenciesValid = await verifyTaskDependencies(task);
     if (!dependenciesValid) {
@@ -4538,7 +4729,7 @@ const executeScheduledTask = async (task) => {
     }
 
     // Filter out tokens that don't exist in current tokens.value
-    const availableTokens = (
+    availableTokens = (
       task.connectedTokens || task.selectedTokens
     ).filter((tokenId) => {
       return tokens.value.some((t) => t.id === tokenId);
@@ -4690,6 +4881,31 @@ const executeScheduledTask = async (task) => {
       `[${new Date().toISOString()}] Error executing scheduled task ${task.name}:`,
       error,
     );
+  } finally {
+    // 确保日常任务连接完全释放后再允许重建推图 Session。
+    for (const tokenId of availableTokens) {
+      try {
+        if (typeof tokenStore.closeWebSocketConnectionAsync === "function") {
+          await tokenStore.closeWebSocketConnectionAsync(tokenId);
+        } else {
+          tokenStore.closeWebSocketConnection(tokenId);
+        }
+      } catch (error) {
+        console.warn(`定时任务清理连接失败 [${tokenId}]`, error);
+      }
+    }
+
+    if (!isScheduledExecution && preemptionLease) {
+      try {
+        await releasePreemptionLease(preemptionLease, "manual-task-finished");
+      } catch (error) {
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `=== 手动任务结束后恢复推图失败: ${error.message} ===`,
+          type: "error",
+        });
+      }
+    }
   }
 };
 
@@ -5951,7 +6167,11 @@ const startBatch = async () => {
         }
       } finally {
         // 完成后关闭连接并释放槽位
-        tokenStore.closeWebSocketConnection(tokenId);
+        if (typeof tokenStore.closeWebSocketConnectionAsync === "function") {
+          await tokenStore.closeWebSocketConnectionAsync(tokenId);
+        } else {
+          tokenStore.closeWebSocketConnection(tokenId);
+        }
         releaseConnectionSlot();
         addLog({
           time: new Date().toLocaleTimeString(),

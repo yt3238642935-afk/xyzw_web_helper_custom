@@ -195,7 +195,11 @@
       </div>
     </n-drawer>
     <div class="main">
-      <router-view />
+      <router-view v-slot="{ Component }">
+        <keep-alive include="BatchDailyTasks,PushingLevels">
+          <component :is="Component" />
+        </keep-alive>
+      </router-view>
     </div>
   </div>
 </template>
